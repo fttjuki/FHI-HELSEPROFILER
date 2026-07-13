@@ -1,8 +1,7 @@
-
 -- ============================================================
 -- H-696 Folkehelseprofiler og tilhorende statistikkbank
 -- Leveranse til Helsedirektoratet (Hdir) 2026
---  Dato: 13.juli.2026 | Laget av: Tingting Feng
+--  Dato: 13.juli.2026 | Versjon 8 | Laget av: Tingting Feng
 --
 -- ============================================================
 -- BEKREFTET tabellstruktur (alle i NPRNasjonaltDatagrunnlag):
@@ -30,9 +29,118 @@
 --   2. I20_I25 ERSTATTET av I21_I22
 --   3. Utvidet til PHV, TSB, PHBU, AVT
 --   4. Alle argangar 2012-2025 pa nytt
+--   5. Omsorgsniva IN (1,2) brukes for SOM, PHV, TSB, PHBU og AVT
+--
+-- FELLES UTVALGSREGEL:
+--   Kun dag- og dognbehandling: omsorgsniva IN (1,2)
+--   Regelen brukes i alle fem tjenesteomrader, ogsa AVT.
+--   AVT kan derfor fa fa eller ingen rader dersom aktiviteten er poliklinisk.
 -- ============================================================
 
 USE NPRNasjonaltDatagrunnlag;
+
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+
+DROP TABLE IF EXISTS tmp.H696_AVT_omsorgsniva_kontroll;
+DROP TABLE IF EXISTS tmp.H696_SOM_uttrekk;
+DROP TABLE IF EXISTS tmp.H696_PHV_uttrekk;
+DROP TABLE IF EXISTS tmp.H696_TSB_uttrekk;
+DROP TABLE IF EXISTS tmp.H696_PHBU_uttrekk;
+DROP TABLE IF EXISTS tmp.H696_AVT_uttrekk;
+DROP TABLE IF EXISTS tmp.H696_bosted_v8;
+
+GO
+
+USE NPRNasjonaltDatagrunnlag;
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+
+-- ============================================================
+-- DEL 0: FORHÅNDSKONTROLL AV OMSORGSNIVÅ
+--
+-- Kontrollen kjøres før uttrekkene og viser om AVTPHV faktisk har
+-- relevante hoveddiagnoser på omsorgsnivå 1 eller 2. Resultatet lagres
+-- også i tmp.H696_AVT_omsorgsniva_kontroll og leses inn av R-scriptet.
+-- ============================================================
+
+IF EXISTS (
+    SELECT krav.tabellnavn
+    FROM (VALUES
+        ('SOMHoved'),
+        ('PHVHoved'),
+        ('TSBHoved'),
+        ('PHBUHoved'),
+        ('AVTHoved')
+    ) AS krav(tabellnavn)
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM sys.objects AS t
+        INNER JOIN sys.columns AS c
+            ON c.object_id = t.object_id
+        WHERE t.type IN ('U', 'V')
+          AND t.name = krav.tabellnavn
+          AND c.name = 'omsorgsniva'
+    )
+)
+BEGIN
+    THROW 50001, 'Minst 1 hovedtabell mangler kolonnen omsorgsniva. Kontroller tabellstrukturen før uttrekket kjøres.', 1;
+END;
+
+DROP TABLE IF EXISTS tmp.H696_AVT_omsorgsniva_kontroll;
+
+SELECT
+    b.omsorgsniva,
+    CASE
+        WHEN b.omsorgsniva IN (1, 2) THEN 'Med i uttrekk'
+        ELSE 'Ikke med i uttrekk'
+    END AS filterstatus,
+    COUNT(*) AS n_koderader,
+    COUNT(DISTINCT b.asp_k) AS n_opphold,
+    COUNT(DISTINCT b.NPRId) AS n_pasienter
+INTO tmp.H696_AVT_omsorgsniva_kontroll
+FROM AVTKoder AS a
+INNER JOIN AVTHoved AS b
+    ON b.asp_k = a.asp_k
+   AND b.aar = a.aar
+WHERE LEN(b.NPRId) < 12
+  AND a.aar BETWEEN 2012 AND 2025
+  AND a.KodeType = 6
+  AND a.KodeNr IN (11, 12)
+  AND LEFT(a.KodeVerdi, 3) BETWEEN 'F00' AND 'F99'
+GROUP BY
+    b.omsorgsniva,
+    CASE
+        WHEN b.omsorgsniva IN (1, 2) THEN 'Med i uttrekk'
+        ELSE 'Ikke med i uttrekk'
+    END;
+
+SELECT
+    omsorgsniva,
+    filterstatus,
+    n_koderader,
+    n_opphold,
+    n_pasienter
+FROM tmp.H696_AVT_omsorgsniva_kontroll
+ORDER BY
+    CASE WHEN omsorgsniva IS NULL THEN 1 ELSE 0 END,
+    omsorgsniva;
+
+SELECT
+    COUNT(DISTINCT b.asp_k) AS avt_opphold_med_i_uttrekk,
+    COUNT(DISTINCT b.NPRId) AS avt_pasienter_med_i_uttrekk
+FROM AVTKoder AS a
+INNER JOIN AVTHoved AS b
+    ON b.asp_k = a.asp_k
+   AND b.aar = a.aar
+WHERE LEN(b.NPRId) < 12
+  AND a.aar BETWEEN 2012 AND 2025
+  AND a.KodeType = 6
+  AND a.KodeNr IN (11, 12)
+  AND LEFT(a.KodeVerdi, 3) BETWEEN 'F00' AND 'F99'
+  AND b.omsorgsniva IN (1, 2);
 
 
 -- ============================================================
@@ -44,7 +152,7 @@ DROP TABLE IF EXISTS tmp.H696_SOM_uttrekk;
 SELECT * INTO tmp.H696_SOM_uttrekk
 FROM (
     SELECT
-        NPRId, nokkel, alder, kjonn, komNrHjem, aar, tjeneste,
+        NPRId, nokkel, alder, kjonn, komNrHjem, aar, tjeneste, omsorgsniva,
         MAX(I00_I99)   OVER (PARTITION BY nokkel) AS I00_I99,
         MAX(I21_I22)   OVER (PARTITION BY nokkel) AS I21_I22,
         MAX(J44)       OVER (PARTITION BY nokkel) AS J44,
@@ -62,6 +170,7 @@ FROM (
             CONCAT('SOM', a.som_k) AS nokkel,
             a.aar - d.fodtAar      AS alder,
             b.komnrhjem2           AS komNrHjem,
+            b.omsorgsniva           AS omsorgsniva,
             CASE
                 WHEN COALESCE(d.kjonn, b.kjonn) = '1' THEN 'Menn'
                 WHEN COALESCE(d.kjonn, b.kjonn) = '2' THEN 'Kvinner'
@@ -78,8 +187,9 @@ FROM (
             CASE WHEN LEFT(a.KodeVerdi,3) BETWEEN 'T36' AND 'T65' THEN 1 ELSE 0 END AS T36_T65,
             CASE WHEN LEFT(a.KodeVerdi,3) BETWEEN 'S00' AND 'S09' THEN 1 ELSE 0 END AS S00_S09
         FROM SOMKoder AS a
-        LEFT JOIN SOMHoved AS b
+        INNER JOIN SOMHoved AS b
             ON b.som_k = a.som_k
+           AND b.aar = a.aar
         LEFT JOIN NPRPerson.NPR.FodtAarMndOgKjonn AS d
             ON CAST(d.NPRId AS varchar) = b.NPRId
         WHERE LEN(b.NPRId) < 12
@@ -108,6 +218,7 @@ FROM tmp.H696_SOM_uttrekk GROUP BY aar ORDER BY aar;
 
 -- ============================================================
 -- DEL 1B: PHV - Psykisk helsevern voksne
+-- Kun dag- og dognbehandling: omsorgsniva IN (1,2)
 -- ============================================================
 
 DROP TABLE IF EXISTS tmp.H696_PHV_uttrekk;
@@ -115,7 +226,7 @@ DROP TABLE IF EXISTS tmp.H696_PHV_uttrekk;
 SELECT * INTO tmp.H696_PHV_uttrekk
 FROM (
     SELECT
-        NPRId, nokkel, alder, kjonn, komNrHjem, aar, tjeneste,
+        NPRId, nokkel, alder, kjonn, komNrHjem, aar, tjeneste, omsorgsniva,
         MAX(F00_F99)         OVER (PARTITION BY nokkel) AS F00_F99,
         MAX(F30_F39)         OVER (PARTITION BY nokkel) AS F30_F39,
         MAX(F40_F48)         OVER (PARTITION BY nokkel) AS F40_F48,
@@ -130,6 +241,7 @@ FROM (
             CONCAT('PHV', a.phv_k) AS nokkel,
             a.aar - d.fodtAar      AS alder,
             b.komnrhjem2           AS komNrHjem,
+            b.omsorgsniva           AS omsorgsniva,
             CASE
                 WHEN COALESCE(d.kjonn, b.kjonn) = '1' THEN 'Menn'
                 WHEN COALESCE(d.kjonn, b.kjonn) = '2' THEN 'Kvinner'
@@ -145,8 +257,9 @@ FROM (
             CASE WHEN (LEFT(a.KodeVerdi,3) BETWEEN 'F11' AND 'F16'
                        OR LEFT(a.KodeVerdi,3) IN ('F18','F19')) THEN 1 ELSE 0 END AS F11_F16_F18_F19
         FROM PHVKoder AS a
-        LEFT JOIN PHVHoved AS b
+        INNER JOIN PHVHoved AS b
             ON b.phv_k = a.phv_k
+           AND b.aar = a.aar
         LEFT JOIN NPRPerson.NPR.FodtAarMndOgKjonn AS d
             ON CAST(d.NPRId AS varchar) = b.NPRId
         WHERE LEN(b.NPRId) < 12
@@ -155,6 +268,7 @@ FROM (
           AND a.KodeType = 6
           AND a.KodeNr IN (11,12)
           AND LEFT(a.KodeVerdi,3) BETWEEN 'F00' AND 'F99'
+          AND b.omsorgsniva IN (1,2)
     ) AS Merking
 ) AS aggregering
 WHERE episoderad = 1;
@@ -165,6 +279,7 @@ FROM tmp.H696_PHV_uttrekk GROUP BY aar ORDER BY aar;
 
 -- ============================================================
 -- DEL 1C: TSB - Tverrfaglig spesialisert rusbehandling
+-- Kun dag- og dognbehandling: omsorgsniva IN (1,2)
 -- ============================================================
 
 DROP TABLE IF EXISTS tmp.H696_TSB_uttrekk;
@@ -172,7 +287,7 @@ DROP TABLE IF EXISTS tmp.H696_TSB_uttrekk;
 SELECT * INTO tmp.H696_TSB_uttrekk
 FROM (
     SELECT
-        NPRId, nokkel, alder, kjonn, komNrHjem, aar, tjeneste,
+        NPRId, nokkel, alder, kjonn, komNrHjem, aar, tjeneste, omsorgsniva,
         MAX(F00_F99)         OVER (PARTITION BY nokkel) AS F00_F99,
         MAX(F30_F39)         OVER (PARTITION BY nokkel) AS F30_F39,
         MAX(F40_F48)         OVER (PARTITION BY nokkel) AS F40_F48,
@@ -187,6 +302,7 @@ FROM (
             CONCAT('TSB', a.phv_k) AS nokkel,
             a.aar - d.fodtAar      AS alder,
             b.komnrhjem2           AS komNrHjem,
+            b.omsorgsniva           AS omsorgsniva,
             CASE
                 WHEN COALESCE(d.kjonn, b.kjonn) = '1' THEN 'Menn'
                 WHEN COALESCE(d.kjonn, b.kjonn) = '2' THEN 'Kvinner'
@@ -202,8 +318,9 @@ FROM (
             CASE WHEN (LEFT(a.KodeVerdi,3) BETWEEN 'F11' AND 'F16'
                        OR LEFT(a.KodeVerdi,3) IN ('F18','F19')) THEN 1 ELSE 0 END AS F11_F16_F18_F19
         FROM TSBKoder AS a
-        LEFT JOIN TSBHoved AS b
+        INNER JOIN TSBHoved AS b
             ON b.phv_k = a.phv_k
+           AND b.aar = a.aar
         LEFT JOIN NPRPerson.NPR.FodtAarMndOgKjonn AS d
             ON CAST(d.NPRId AS varchar) = b.NPRId
         WHERE LEN(b.NPRId) < 12
@@ -212,6 +329,7 @@ FROM (
           AND a.KodeType = 6
           AND a.KodeNr IN (11,12)
           AND LEFT(a.KodeVerdi,3) BETWEEN 'F00' AND 'F99'
+          AND b.omsorgsniva IN (1,2)
     ) AS Merking
 ) AS aggregering
 WHERE episoderad = 1;
@@ -222,6 +340,7 @@ FROM tmp.H696_TSB_uttrekk GROUP BY aar ORDER BY aar;
 
 -- ============================================================
 -- DEL 1D: PHBU - Psykisk helsevern barn og unge
+-- Kun dag- og dognbehandling: omsorgsniva IN (1,2)
 -- Hovedtilstand: Akse = 1 (klinisk psyk. syndrom, F00-F99)
 --                Tilstand = 1 (hovedtilstand)
 -- ============================================================
@@ -231,7 +350,7 @@ DROP TABLE IF EXISTS tmp.H696_PHBU_uttrekk;
 SELECT * INTO tmp.H696_PHBU_uttrekk
 FROM (
     SELECT
-        NPRId, nokkel, alder, kjonn, komNrHjem, aar, tjeneste,
+        NPRId, nokkel, alder, kjonn, komNrHjem, aar, tjeneste, omsorgsniva,
         MAX(F00_F99)         OVER (PARTITION BY nokkel) AS F00_F99,
         MAX(F30_F39)         OVER (PARTITION BY nokkel) AS F30_F39,
         MAX(F40_F48)         OVER (PARTITION BY nokkel) AS F40_F48,
@@ -246,6 +365,7 @@ FROM (
             CONCAT('PHBU', a.bup_k) AS nokkel,
             a.aar - d.fodtAar       AS alder,
             b.komnrhjem2            AS komNrHjem,
+            b.omsorgsniva            AS omsorgsniva,
             CASE
                 WHEN COALESCE(d.kjonn, b.kjonn) = '1' THEN 'Menn'
                 WHEN COALESCE(d.kjonn, b.kjonn) = '2' THEN 'Kvinner'
@@ -261,8 +381,9 @@ FROM (
             CASE WHEN (LEFT(a.KodeVerdi,3) BETWEEN 'F11' AND 'F16'
                        OR LEFT(a.KodeVerdi,3) IN ('F18','F19')) THEN 1 ELSE 0 END AS F11_F16_F18_F19
         FROM PHBUKoder AS a
-        LEFT JOIN PHBUHoved AS b
+        INNER JOIN PHBUHoved AS b
             ON b.bup_k = a.bup_k
+           AND b.aar = a.aar
         LEFT JOIN NPRPerson.NPR.FodtAarMndOgKjonn AS d
             ON CAST(d.NPRId AS varchar) = b.NPRId
         WHERE LEN(b.NPRId) < 12
@@ -271,6 +392,7 @@ FROM (
           AND a.Akse = 1          -- Akse I: klinisk psykiatrisk syndrom (F00-F99)
           AND a.Tilstand = 1      -- hovedtilstand
           AND LEFT(a.KodeVerdi,3) BETWEEN 'F00' AND 'F99'
+          AND b.omsorgsniva IN (1,2)
     ) AS Merking
 ) AS aggregering
 WHERE episoderad = 1;
@@ -281,6 +403,8 @@ FROM tmp.H696_PHBU_uttrekk GROUP BY aar ORDER BY aar;
 
 -- ============================================================
 -- DEL 1E: AVT - Avtalespesialister psykisk helsevern voksne
+-- Kun dag- og dognbehandling: omsorgsniva IN (1,2)
+
 -- ============================================================
 
 DROP TABLE IF EXISTS tmp.H696_AVT_uttrekk;
@@ -288,7 +412,7 @@ DROP TABLE IF EXISTS tmp.H696_AVT_uttrekk;
 SELECT * INTO tmp.H696_AVT_uttrekk
 FROM (
     SELECT
-        NPRId, nokkel, alder, kjonn, komNrHjem, aar, tjeneste,
+        NPRId, nokkel, alder, kjonn, komNrHjem, aar, tjeneste, omsorgsniva,
         MAX(F00_F99)         OVER (PARTITION BY nokkel) AS F00_F99,
         MAX(F30_F39)         OVER (PARTITION BY nokkel) AS F30_F39,
         MAX(F40_F48)         OVER (PARTITION BY nokkel) AS F40_F48,
@@ -303,6 +427,7 @@ FROM (
             CONCAT('AVT', a.asp_k) AS nokkel,
             a.aar - d.fodtAar      AS alder,
             b.komnrhjem2           AS komNrHjem,
+            b.omsorgsniva           AS omsorgsniva,
             CASE
                 WHEN COALESCE(d.kjonn, b.kjonn) = '1' THEN 'Menn'
                 WHEN COALESCE(d.kjonn, b.kjonn) = '2' THEN 'Kvinner'
@@ -318,8 +443,9 @@ FROM (
             CASE WHEN (LEFT(a.KodeVerdi,3) BETWEEN 'F11' AND 'F16'
                        OR LEFT(a.KodeVerdi,3) IN ('F18','F19')) THEN 1 ELSE 0 END AS F11_F16_F18_F19
         FROM AVTKoder AS a
-        LEFT JOIN AVTHoved AS b
+        INNER JOIN AVTHoved AS b
             ON b.asp_k = a.asp_k
+           AND b.aar = a.aar
         LEFT JOIN NPRPerson.NPR.FodtAarMndOgKjonn AS d
             ON CAST(d.NPRId AS varchar) = b.NPRId
         WHERE LEN(b.NPRId) < 12
@@ -328,6 +454,7 @@ FROM (
           AND a.KodeType = 6
           AND a.KodeNr IN (11,12)
           AND LEFT(a.KodeVerdi,3) BETWEEN 'F00' AND 'F99'
+          AND b.omsorgsniva IN (1,2)
     ) AS Merking
 ) AS aggregering
 WHERE episoderad = 1;
@@ -349,7 +476,7 @@ UNION SELECT DISTINCT NPRId FROM tmp.H696_TSB_uttrekk
 UNION SELECT DISTINCT NPRId FROM tmp.H696_PHBU_uttrekk
 UNION SELECT DISTINCT NPRId FROM tmp.H696_AVT_uttrekk;
 
-DROP TABLE IF EXISTS tmp.H696_bosted_v5;
+DROP TABLE IF EXISTS tmp.H696_bosted_v8;
 
 SELECT DISTINCT NPRid,
     MAX(kom_1_1_2012)  OVER (PARTITION BY NPRId) AS kom_1_1_2012,
@@ -380,7 +507,7 @@ SELECT DISTINCT NPRid,
     MAX(kom_31_12_2023) OVER (PARTITION BY NPRId) AS kom_31_12_2023,
     MAX(kom_31_12_2024) OVER (PARTITION BY NPRId) AS kom_31_12_2024,
     MAX(kom_31_12_2025) OVER (PARTITION BY NPRId) AS kom_31_12_2025
-INTO tmp.H696_bosted_v5
+INTO tmp.H696_bosted_v8
 FROM (
     SELECT
         s.NPRId,
@@ -417,29 +544,52 @@ FROM (
         ON s.NPRId = CAST(bo.NPRId AS varchar(128))
 ) AS maxed;
 
-SELECT COUNT(DISTINCT NPRid) AS n_unike_i_bosted FROM tmp.H696_bosted_v5;
-SELECT TOP 5 * FROM tmp.H696_bosted_v5;
+SELECT COUNT(DISTINCT NPRid) AS n_unike_i_bosted FROM tmp.H696_bosted_v8;
+SELECT TOP 5 * FROM tmp.H696_bosted_v8;
 
+
+-- Ferdig med opprettelse av uttrekkstabeller og bostedstabell.
+-- Ny batch sikrer at QA kompileres mot den NYE tabellstrukturen.
+GO
+
+USE NPRNasjonaltDatagrunnlag;
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
 
 -- ============================================================
 -- DEL 3: QA-KONTROLLER
 -- ============================================================
 
--- 3a: Unike pasienter per tjeneste
+-- 3.0: Kontroller at alle fem uttrekkstabellene faktisk har omsorgsniva.
+IF COL_LENGTH('tmp.H696_SOM_uttrekk',  'omsorgsniva') IS NULL
+ OR COL_LENGTH('tmp.H696_PHV_uttrekk',  'omsorgsniva') IS NULL
+ OR COL_LENGTH('tmp.H696_TSB_uttrekk',  'omsorgsniva') IS NULL
+ OR COL_LENGTH('tmp.H696_PHBU_uttrekk', 'omsorgsniva') IS NULL
+ OR COL_LENGTH('tmp.H696_AVT_uttrekk',  'omsorgsniva') IS NULL
+BEGIN
+    THROW 50002, 'Minst 1 uttrekkstabell mangler kolonnen omsorgsniva. Kjør hele SQL-script versjon 8 fra starten.', 1;
+END;
+
+-- 3a: Forhåndskontroll AVTPHV før omsorgsnivåfilter
+SELECT *
+FROM tmp.H696_AVT_omsorgsniva_kontroll
+ORDER BY CASE WHEN omsorgsniva IS NULL THEN 1 ELSE 0 END, omsorgsniva;
+
+-- 3b: Unike pasienter per tjeneste
 SELECT 'SOM'  AS tjeneste, COUNT(DISTINCT NPRId) AS n FROM tmp.H696_SOM_uttrekk  UNION ALL
 SELECT 'PHV',  COUNT(DISTINCT NPRId) FROM tmp.H696_PHV_uttrekk  UNION ALL
 SELECT 'TSB',  COUNT(DISTINCT NPRId) FROM tmp.H696_TSB_uttrekk  UNION ALL
 SELECT 'PHBU', COUNT(DISTINCT NPRId) FROM tmp.H696_PHBU_uttrekk UNION ALL
 SELECT 'AVT',  COUNT(DISTINCT NPRId) FROM tmp.H696_AVT_uttrekk;
 
--- 3b: Arsspenn (skal vaere 2012-2025)
+-- 3c: Arsspenn (skal vaere 2012-2025)
 SELECT 'SOM'  AS tjeneste, MIN(aar) AS min_aar, MAX(aar) AS max_aar FROM tmp.H696_SOM_uttrekk  UNION ALL
 SELECT 'PHV',  MIN(aar), MAX(aar) FROM tmp.H696_PHV_uttrekk  UNION ALL
 SELECT 'TSB',  MIN(aar), MAX(aar) FROM tmp.H696_TSB_uttrekk  UNION ALL
 SELECT 'PHBU', MIN(aar), MAX(aar) FROM tmp.H696_PHBU_uttrekk UNION ALL
 SELECT 'AVT',  MIN(aar), MAX(aar) FROM tmp.H696_AVT_uttrekk;
 
--- 3c: Kjonnsfordeling
+-- 3d: Kjonnsfordeling
 SELECT tjeneste, kjonn, COUNT(*) AS n FROM (
     SELECT 'SOM'  AS tjeneste, kjonn FROM tmp.H696_SOM_uttrekk  UNION ALL
     SELECT 'PHV',  kjonn FROM tmp.H696_PHV_uttrekk  UNION ALL
@@ -447,5 +597,35 @@ SELECT tjeneste, kjonn, COUNT(*) AS n FROM (
     SELECT 'PHBU', kjonn FROM tmp.H696_PHBU_uttrekk UNION ALL
     SELECT 'AVT',  kjonn FROM tmp.H696_AVT_uttrekk
 ) x GROUP BY tjeneste, kjonn ORDER BY tjeneste, kjonn;
+
+
+-- 3e: Fordeling pa omsorgsniva etter filter
+-- Forventning: bare verdiene 1 og 2.
+SELECT tjeneste, omsorgsniva, COUNT(*) AS n
+FROM (
+    SELECT 'SOM'  AS tjeneste, omsorgsniva FROM tmp.H696_SOM_uttrekk  UNION ALL
+    SELECT 'PHV',  omsorgsniva FROM tmp.H696_PHV_uttrekk  UNION ALL
+    SELECT 'TSB',  omsorgsniva FROM tmp.H696_TSB_uttrekk  UNION ALL
+    SELECT 'PHBU', omsorgsniva FROM tmp.H696_PHBU_uttrekk UNION ALL
+    SELECT 'AVT',  omsorgsniva FROM tmp.H696_AVT_uttrekk
+) x
+GROUP BY tjeneste, omsorgsniva
+ORDER BY tjeneste, omsorgsniva;
+
+-- 3f: Rader som bryter utvalgsregelen
+-- Forventning: ingen rader i resultatet.
+SELECT tjeneste, COUNT(*) AS n_ugyldig_omsorgsniva
+FROM (
+    SELECT 'SOM'  AS tjeneste, omsorgsniva FROM tmp.H696_SOM_uttrekk  UNION ALL
+    SELECT 'PHV',  omsorgsniva FROM tmp.H696_PHV_uttrekk  UNION ALL
+    SELECT 'TSB',  omsorgsniva FROM tmp.H696_TSB_uttrekk  UNION ALL
+    SELECT 'PHBU', omsorgsniva FROM tmp.H696_PHBU_uttrekk UNION ALL
+    SELECT 'AVT',  omsorgsniva FROM tmp.H696_AVT_uttrekk
+) x
+WHERE omsorgsniva NOT IN (1,2) OR omsorgsniva IS NULL
+GROUP BY tjeneste
+ORDER BY tjeneste;
+
+
 
 
